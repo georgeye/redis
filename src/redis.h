@@ -291,6 +291,7 @@ typedef struct redisDb {
     dict *expires;              /* Timeout of keys with a timeout set */
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    robj *expire_channel;       /* Dead Letter Channel for expired keys */
     int id;
 } redisDb;
 
@@ -1099,6 +1100,9 @@ void evalCommand(redisClient *c);
 void evalShaCommand(redisClient *c);
 void scriptCommand(redisClient *c);
 void timeCommand(redisClient *c);
+void recycleCommand(redisClient *c);
+void recycletoCommand(redisClient *c);
+void disposeCommand(redisClient *c);
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));

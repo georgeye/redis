@@ -457,7 +457,8 @@ void propagateExpire(redisDb *db, robj *key) {
     argv[1] = key;
     incrRefCount(argv[0]);
     incrRefCount(argv[1]);
-
+    if (db->expire_channel)
+        pubsubPublishMessage(db->expire_channel,key);
     if (server.aof_state != REDIS_AOF_OFF)
         feedAppendOnlyFile(server.delCommand,db->id,argv,2);
     if (listLength(server.slaves))
@@ -465,6 +466,30 @@ void propagateExpire(redisDb *db, robj *key) {
 
     decrRefCount(argv[0]);
     decrRefCount(argv[1]);
+}
+
+void recycleCommand(redisClient *c) {
+    c->db->expire_channel = c->argv[1];
+    subscribeCommand(c);
+}
+  
+void recycletoCommand(redisClient *c) {
+    if (c->db->expire_channel == NULL) {
+        addReply(c,shared.ok);
+    } else {
+        addReply(c,c->db->expire_channel);
+    }
+}
+
+void disposeCommand(redisClient *c) {
+    if (c->db->expire_channel == NULL) {
+        addReply(c,shared.err);
+    } else {
+        c->argc = 1;
+        c->argv[1] = c->db->expire_channel;
+        c->db->expire_channel = NULL;
+        unsubscribeCommand(c);
+    }
 }
 
 int expireIfNeeded(redisDb *db, robj *key) {

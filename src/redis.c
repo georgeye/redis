@@ -242,7 +242,10 @@ struct redisCommand redisCommandTable[] = {
     {"evalsha",evalShaCommand,-3,"s",0,zunionInterGetKeys,0,0,0,0,0},
     {"slowlog",slowlogCommand,-2,"r",0,NULL,0,0,0,0,0},
     {"script",scriptCommand,-2,"ras",0,NULL,0,0,0,0,0},
-    {"time",timeCommand,1,"rR",0,NULL,0,0,0,0,0}
+    {"time",timeCommand,1,"rR",0,NULL,0,0,0,0,0},
+    {"recycle",recycleCommand,2, "r", 0,NULL,1,1,1,0,0},
+    {"recycleto",recycletoCommand,1, "r", 0,NULL,0,0,0,0,0},
+    {"dispose",disposeCommand,1,"r", 0,NULL,0,0,0,0,0}
 };
 
 /*============================ Utility functions ============================ */
@@ -1216,6 +1219,7 @@ void initServer() {
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].id = j;
+        server.db[j].expire_channel = NULL;
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
@@ -1532,8 +1536,9 @@ int processCommand(redisClient *c) {
         c->cmd->proc != subscribeCommand &&
         c->cmd->proc != unsubscribeCommand &&
         c->cmd->proc != psubscribeCommand &&
-        c->cmd->proc != punsubscribeCommand) {
-        addReplyError(c,"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / QUIT allowed in this context");
+        c->cmd->proc != punsubscribeCommand &&
+        c->cmd->proc != disposeCommand) {
+        addReplyError(c,"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / QUIT /DISPOSE allowed in this context");
         return REDIS_OK;
     }
 
