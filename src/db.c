@@ -472,12 +472,12 @@ void recycleCommand(redisClient *c) {
     c->db->expire_channel = c->argv[1];
     subscribeCommand(c);
 }
-  
+
 void recycletoCommand(redisClient *c) {
     if (c->db->expire_channel == NULL) {
         addReply(c,shared.ok);
     } else {
-        addReply(c,c->db->expire_channel);
+        addReplyBulk(c,c->db->expire_channel);
     }
 }
 
