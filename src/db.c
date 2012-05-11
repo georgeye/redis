@@ -458,7 +458,8 @@ void propagateExpire(redisDb *db, robj *key) {
     incrRefCount(argv[0]);
     incrRefCount(argv[1]);
     if (db->expire_channel)
-        pubsubPublishMessage(db->expire_channel,key);
+       // pubsubPublishMessage(db->expire_channel,key);
+       push_to_queue(db, db->expire_channel, key);
     if (server.aof_state != REDIS_AOF_OFF)
         feedAppendOnlyFile(server.delCommand,db->id,argv,2);
     if (listLength(server.slaves))
@@ -468,9 +469,27 @@ void propagateExpire(redisDb *db, robj *key) {
     decrRefCount(argv[1]);
 }
 
+void push_to_queue(redisDb *db, robj *q, robj *value) {
+    static redisClient *c = NULL;
+    int argc = 3;
+    if(c == NULL) {
+        robj **argv;
+        argv = zmalloc(sizeof(robj*)*argc);
+        c = createClient(-1); //fake a client
+        c->argc = argc;
+        c->argv = argv;
+    }
+    c->argv[1] = q;
+    c->argv[2] = value;
+    c->flags |= REDIS_LUA_CLIENT; //use the same logic as lua client
+    //redisLog(REDIS_NOTICE, "pushing expired events to queue");
+    rpushCommand(c);
+}
+
 void recycleCommand(redisClient *c) {
-    c->db->expire_channel = c->argv[1];
-    subscribeCommand(c);
+    c->db->expire_channel = createStringObject(c->argv[1]->ptr, strlen(c->argv[1]->ptr));
+    addReply(c,shared.ok);
+    //subscribeCommand(c);
 }
 
 void recycletoCommand(redisClient *c) {
@@ -482,14 +501,8 @@ void recycletoCommand(redisClient *c) {
 }
 
 void disposeCommand(redisClient *c) {
-    if (c->db->expire_channel == NULL) {
-        addReply(c,shared.err);
-    } else {
-        c->argc = 1;
-        c->argv[1] = c->db->expire_channel;
-        c->db->expire_channel = NULL;
-        unsubscribeCommand(c);
-    }
+    c->db->expire_channel = NULL;
+    addReply(c, shared.ok);
 }
 
 int expireIfNeeded(redisDb *db, robj *key) {

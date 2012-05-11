@@ -1103,6 +1103,7 @@ void timeCommand(redisClient *c);
 void recycleCommand(redisClient *c);
 void recycletoCommand(redisClient *c);
 void disposeCommand(redisClient *c);
+void push_to_queue(redisDb *db, robj *q, robj *value);
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));
