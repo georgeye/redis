@@ -1219,7 +1219,7 @@ void initServer() {
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].id = j;
-        server.db[j].expire_channel = NULL;
+        server.db[j].expire_channel = createStringObject("expiration_channel", strlen("expiration_channel"));
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
