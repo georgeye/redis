@@ -1,6 +1,6 @@
 /* Redis CLI (command line interface)
  *
- * Copyright (c) 2009-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -35,17 +35,21 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 #include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <assert.h>
+#include <fcntl.h>
 
 #include "hiredis.h"
 #include "sds.h"
 #include "zmalloc.h"
 #include "linenoise.h"
 #include "help.h"
+#include "anet.h"
+#include "ae.h"
 
 #define REDIS_NOTUSED(V) ((void) V)
 
@@ -69,6 +73,9 @@ static struct config {
     int cluster_mode;
     int cluster_reissue_command;
     int slave_mode;
+    int pipe_mode;
+    int getrdb_mode;
+    char *rdb_filename;
     int bigkeys;
     int stdinarg; /* get last arg from stdin. (-x option) */
     char *auth;
@@ -91,7 +98,7 @@ static long long mstime(void) {
     long long mst;
 
     gettimeofday(&tv, NULL);
-    mst = ((long)tv.tv_sec)*1000;
+    mst = ((long long)tv.tv_sec)*1000;
     mst += tv.tv_usec/1000;
     return mst;
 }
@@ -301,7 +308,7 @@ static int cliSelect() {
     return REDIS_ERR;
 }
 
-/* Connect to the client. If force is not zero the connection is performed
+/* Connect to the server. If force is not zero the connection is performed
  * even if there is already a connected socket. */
 static int cliConnect(int force) {
     if (context == NULL || force) {
@@ -656,6 +663,11 @@ static int parseOptions(int argc, char **argv) {
             config.latency_mode = 1;
         } else if (!strcmp(argv[i],"--slave")) {
             config.slave_mode = 1;
+        } else if (!strcmp(argv[i],"--rdb") && !lastarg) {
+            config.getrdb_mode = 1;
+            config.rdb_filename = argv[++i];
+        } else if (!strcmp(argv[i],"--pipe")) {
+            config.pipe_mode = 1;
         } else if (!strcmp(argv[i],"--bigkeys")) {
             config.bigkeys = 1;
         } else if (!strcmp(argv[i],"--eval") && !lastarg) {
@@ -706,16 +718,18 @@ static void usage() {
 "  -a <password>    Password to use when connecting to the server\n"
 "  -r <repeat>      Execute specified command N times\n"
 "  -i <interval>    When -r is used, waits <interval> seconds per command.\n"
-"                   It is possible to specify sub-second times like -i 0.1.\n"
+"                   It is possible to specify sub-second times like -i 0.1\n"
 "  -n <db>          Database number\n"
 "  -x               Read last argument from STDIN\n"
 "  -d <delimiter>   Multi-bulk delimiter in for raw formatting (default: \\n)\n"
 "  -c               Enable cluster mode (follow -ASK and -MOVED redirections)\n"
 "  --raw            Use raw formatting for replies (default when STDOUT is not a tty)\n"
-"  --latency        Enter a special mode continuously sampling latency.\n"
-"  --slave          Simulate a slave showing commands received from the master.\n"
-"  --bigkeys        Sample Redis keys looking for big keys.\n"
-"  --eval <file>    Send an EVAL command using the Lua script at <file>.\n"
+"  --latency        Enter a special mode continuously sampling latency\n"
+"  --slave          Simulate a slave showing commands received from the master\n"
+"  --rdb <filename> Transfer an RDB dump from remote server to local file.\n"
+"  --pipe           Transfer raw Redis protocol from stdin to server\n"
+"  --bigkeys        Sample Redis keys looking for big keys\n"
+"  --eval <file>    Send an EVAL command using the Lua script at <file>\n"
 "  --help           Output this help and exit\n"
 "  --version        Output version and exit\n"
 "\n"
@@ -787,6 +801,7 @@ static void repl() {
                     sdsfree(config.hostip);
                     config.hostip = sdsnew(argv[1]);
                     config.hostport = atoi(argv[2]);
+                    cliRefreshPrompt();
                     cliConnect(1);
                 } else if (argc == 1 && !strcasecmp(argv[0],"clear")) {
                     linenoiseClearScreen();
@@ -920,15 +935,15 @@ static void latencyMode(void) {
     }
 }
 
-static void slaveMode(void) {
+/* Sends SYNC and reads the number of bytes in the payload. Used both by
+ * slaveMode() and getRDB(). */
+unsigned long long sendSync(int fd) {
     /* To start we need to send the SYNC command and return the payload.
      * The hiredis client lib does not understand this part of the protocol
      * and we don't want to mess with its buffers, so everything is performed
      * using direct low-level I/O. */
-    int fd = context->fd;
-    char buf[1024], *p;
+    char buf[4096], *p;
     ssize_t nread;
-    unsigned long long payload;
 
     /* Send the SYNC command. */
     if (write(fd,"SYNC\r\n",6) != 6) {
@@ -944,16 +959,29 @@ static void slaveMode(void) {
             fprintf(stderr,"Error reading bulk length while SYNCing\n");
             exit(1);
         }
-        if (*p == '\n') break;
-        p++;
+        if (*p == '\n' && p != buf) break;
+        if (*p != '\n') p++;
     }
     *p = '\0';
-    payload = strtoull(buf+1,NULL,10);
-    fprintf(stderr,"SYNC with master, discarding %lld bytes of bulk tranfer...\n",
-            payload);
+    if (buf[0] == '-') {
+        printf("SYNC with master failed: %s\n", buf);
+        exit(1);
+    }
+    return strtoull(buf+1,NULL,10);
+}
+
+static void slaveMode(void) {
+    int fd = context->fd;
+    unsigned long long payload = sendSync(fd);
+    char buf[1024];
+
+    fprintf(stderr,"SYNC with master, discarding %llu "
+                   "bytes of bulk transfer...\n", payload);
 
     /* Discard the payload. */
     while(payload) {
+        ssize_t nread;
+
         nread = read(fd,buf,(payload > sizeof(buf)) ? sizeof(buf) : payload);
         if (nread <= 0) {
             fprintf(stderr,"Error reading RDB payload while SYNCing\n");
@@ -963,9 +991,185 @@ static void slaveMode(void) {
     }
     fprintf(stderr,"SYNC done. Logging commands from master.\n");
 
-    /* Now we can use the hiredis to read the incoming protocol. */
+    /* Now we can use hiredis to read the incoming protocol. */
     config.output = OUTPUT_CSV;
     while (cliReadReply(0) == REDIS_OK);
+}
+
+/* This function implements --rdb, so it uses the replication protocol in order
+ * to fetch the RDB file from a remote server. */
+static void getRDB(void) {
+    int s = context->fd;
+    int fd;
+    unsigned long long payload = sendSync(s);
+    char buf[4096];
+
+    fprintf(stderr,"SYNC sent to master, writing %llu bytes to '%s'\n",
+        payload, config.rdb_filename);
+
+    /* Write to file. */
+    if (!strcmp(config.rdb_filename,"-")) {
+        fd = STDOUT_FILENO;
+    } else {
+        fd = open(config.rdb_filename, O_CREAT|O_WRONLY, 0644);
+        if (fd == -1) {
+            fprintf(stderr, "Error opening '%s': %s\n", config.rdb_filename,
+                strerror(errno));
+            exit(1);
+        }
+    }
+
+    while(payload) {
+        ssize_t nread, nwritten;
+        
+        nread = read(s,buf,(payload > sizeof(buf)) ? sizeof(buf) : payload);
+        if (nread <= 0) {
+            fprintf(stderr,"I/O Error reading RDB payload from socket\n");
+            exit(1);
+        }
+        nwritten = write(fd, buf, nread);
+        if (nwritten != nread) {
+            fprintf(stderr,"Error writing data to file: %s\n",
+                strerror(errno));
+            exit(1);
+        }
+        payload -= nread;
+    }
+    close(s); /* Close the file descriptor ASAP as fsync() may take time. */
+    fsync(fd);
+    fprintf(stderr,"Transfer finished with success.\n");
+    exit(0);
+}
+
+static void pipeMode(void) {
+    int fd = context->fd;
+    long long errors = 0, replies = 0, obuf_len = 0, obuf_pos = 0;
+    char ibuf[1024*16], obuf[1024*16]; /* Input and output buffers */
+    char aneterr[ANET_ERR_LEN];
+    redisReader *reader = redisReaderCreate();
+    redisReply *reply;
+    int eof = 0; /* True once we consumed all the standard input. */
+    int done = 0;
+    char magic[20]; /* Special reply we recognize. */
+
+    srand(time(NULL));
+
+    /* Use non blocking I/O. */
+    if (anetNonBlock(aneterr,fd) == ANET_ERR) {
+        fprintf(stderr, "Can't set the socket in non blocking mode: %s\n",
+            aneterr);
+        exit(1);
+    }
+
+    /* Transfer raw protocol and read replies from the server at the same
+     * time. */
+    while(!done) {
+        int mask = AE_READABLE;
+
+        if (!eof || obuf_len != 0) mask |= AE_WRITABLE;
+        mask = aeWait(fd,mask,1000);
+
+        /* Handle the readable state: we can read replies from the server. */
+        if (mask & AE_READABLE) {
+            ssize_t nread;
+
+            /* Read from socket and feed the hiredis reader. */
+            do {
+                nread = read(fd,ibuf,sizeof(ibuf));
+                if (nread == -1 && errno != EAGAIN && errno != EINTR) {
+                    fprintf(stderr, "Error reading from the server: %s\n",
+                        strerror(errno));
+                    exit(1);
+                }
+                if (nread > 0) redisReaderFeed(reader,ibuf,nread);
+            } while(nread > 0);
+
+            /* Consume replies. */
+            do {
+                if (redisReaderGetReply(reader,(void**)&reply) == REDIS_ERR) {
+                    fprintf(stderr, "Error reading replies from server\n");
+                    exit(1);
+                }
+                if (reply) {
+                    if (reply->type == REDIS_REPLY_ERROR) {
+                        fprintf(stderr,"%s\n", reply->str);
+                        errors++;
+                    } else if (eof && reply->type == REDIS_REPLY_STRING &&
+                                      reply->len == 20) {
+                        /* Check if this is the reply to our final ECHO 
+                         * command. If so everything was received
+                         * from the server. */
+                        if (memcmp(reply->str,magic,20) == 0) {
+                            printf("Last reply received from server.\n");
+                            done = 1;
+                            replies--;
+                        }
+                    }
+                    replies++;
+                    freeReplyObject(reply);
+                }
+            } while(reply);
+        }
+
+        /* Handle the writable state: we can send protocol to the server. */
+        if (mask & AE_WRITABLE) {
+            while(1) {
+                /* Transfer current buffer to server. */
+                if (obuf_len != 0) {
+                    ssize_t nwritten = write(fd,obuf+obuf_pos,obuf_len);
+                    
+                    if (nwritten == -1) {
+                        if (errno != EAGAIN && errno != EINTR) {
+                            fprintf(stderr, "Error writing to the server: %s\n",
+                                strerror(errno));
+                            exit(1);
+                        } else {
+                            nwritten = 0;
+                        }
+                    }
+                    obuf_len -= nwritten;
+                    obuf_pos += nwritten;
+                    if (obuf_len != 0) break; /* Can't accept more data. */
+                }
+                /* If buffer is empty, load from stdin. */
+                if (obuf_len == 0 && !eof) {
+                    ssize_t nread = read(STDIN_FILENO,obuf,sizeof(obuf));
+
+                    if (nread == 0) {
+                        char echo[] =
+                        "*2\r\n$4\r\nECHO\r\n$20\r\n01234567890123456789\r\n";
+                        int j;
+
+                        eof = 1;
+                        /* Everything transferred, so we queue a special
+                         * ECHO command that we can match in the replies
+                         * to make sure everything was read from the server. */
+                        for (j = 0; j < 20; j++)
+                            magic[j] = rand() & 0xff;
+                        memcpy(echo+19,magic,20);
+                        memcpy(obuf,echo,sizeof(echo)-1);
+                        obuf_len = sizeof(echo)-1;
+                        obuf_pos = 0;
+                        printf("All data transferred. Waiting for the last reply...\n");
+                    } else if (nread == -1) {
+                        fprintf(stderr, "Error reading from stdin: %s\n",
+                            strerror(errno));
+                        exit(1);
+                    } else {
+                        obuf_len = nread;
+                        obuf_pos = 0;
+                    }
+                }
+                if (obuf_len == 0 && eof) break;
+            }
+        }
+    }
+    redisReaderFree(reader);
+    printf("errors: %lld, replies: %lld\n", errors, replies);
+    if (errors)
+        exit(1);
+    else
+        exit(0);
 }
 
 #define TYPE_STRING 0
@@ -979,6 +1183,7 @@ static void findBigKeys(void) {
     unsigned long long samples = 0;
     redisReply *reply1, *reply2, *reply3 = NULL;
     char *sizecmd, *typename[] = {"string","list","set","hash","zset"};
+    char *typeunit[] = {"bytes","items","members","fields","members"};
     int type;
 
     printf("\n# Press ctrl+c when you have had enough of it... :)\n");
@@ -1030,9 +1235,10 @@ static void findBigKeys(void) {
         reply3 = redisCommand(context,"%s %s", sizecmd, reply1->str);
         if (reply3 && reply3->type == REDIS_REPLY_INTEGER) {
             if (biggest[type] < reply3->integer) {
-                printf("[%6s] %s | biggest so far with size %llu\n",
+                printf("Biggest %-6s found so far '%s' with %llu %s.\n",
                     typename[type], reply1->str,
-                    (unsigned long long) reply3->integer);
+                    (unsigned long long) reply3->integer,
+                    typeunit[type]);
                 biggest[type] = reply3->integer;
             }
         }
@@ -1065,6 +1271,9 @@ int main(int argc, char **argv) {
     config.latency_mode = 0;
     config.cluster_mode = 0;
     config.slave_mode = 0;
+    config.getrdb_mode = 0;
+    config.rdb_filename = NULL;
+    config.pipe_mode = 0;
     config.bigkeys = 0;
     config.stdinarg = 0;
     config.auth = NULL;
@@ -1080,21 +1289,33 @@ int main(int argc, char **argv) {
     argc -= firstarg;
     argv += firstarg;
 
-    /* Start in latency mode if appropriate */
+    /* Latency mode */
     if (config.latency_mode) {
-        cliConnect(0);
+        if (cliConnect(0) == REDIS_ERR) exit(1);
         latencyMode();
     }
 
-    /* Start in slave mode if appropriate */
+    /* Slave mode */
     if (config.slave_mode) {
-        cliConnect(0);
+        if (cliConnect(0) == REDIS_ERR) exit(1);
         slaveMode();
+    }
+
+    /* Get RDB mode. */
+    if (config.getrdb_mode) {
+        if (cliConnect(0) == REDIS_ERR) exit(1);
+        getRDB();
+    }
+
+    /* Pipe mode */
+    if (config.pipe_mode) {
+        if (cliConnect(0) == REDIS_ERR) exit(1);
+        pipeMode();
     }
 
     /* Find big keys */
     if (config.bigkeys) {
-        cliConnect(0);
+        if (cliConnect(0) == REDIS_ERR) exit(1);
         findBigKeys();
     }
 

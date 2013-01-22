@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include "lzf.h"    /* LZF compression library */
 #include "zipmap.h"
@@ -21,6 +50,9 @@ int rdbSaveType(rio *rdb, unsigned char type) {
     return rdbWriteRaw(rdb,&type,1);
 }
 
+/* Load a "type" in RDB format, that is a one byte unsigned integer.
+ * This function is not only used to load object types, but also special
+ * "types" like the end-of-file type, the EXPIRE type, and so forth. */
 int rdbLoadType(rio *rdb) {
     unsigned char type;
     if (rioRead(rdb,&type,1) == 0) return -1;
@@ -233,7 +265,7 @@ err:
     return NULL;
 }
 
-/* Save a string objet as [len][data] on disk. If the object is a string
+/* Save a string object as [len][data] on disk. If the object is a string
  * representation of an integer value we try to save it in a special form */
 int rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
     int enclen;
@@ -289,7 +321,7 @@ int rdbSaveLongLongAsStringObject(rio *rdb, long long value) {
 /* Like rdbSaveStringObjectRaw() but handle encoded objects */
 int rdbSaveStringObject(rio *rdb, robj *obj) {
     /* Avoid to decode the object, then encode it again, if the
-     * object is alrady integer encoded. */
+     * object is already integer encoded. */
     if (obj->encoding == REDIS_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
     } else {
@@ -335,7 +367,7 @@ robj *rdbLoadEncodedStringObject(rio *rdb) {
 }
 
 /* Save a double value. Doubles are saved as strings prefixed by an unsigned
- * 8 bit integer specifing the length of the representation.
+ * 8 bit integer specifying the length of the representation.
  * This 8 bit integer has special values in order to specify the following
  * conditions:
  * 253: not a number
@@ -433,7 +465,8 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
     return -1; /* avoid warning */
 }
 
-/* Load object type. Return -1 when the byte doesn't contain an object type. */
+/* Use rdbLoadType() to load a TYPE in RDB format, but returns -1 if the
+ * type is not specifically a valid Object Type. */
 int rdbLoadObjectType(rio *rdb) {
     int type;
     if ((type = rdbLoadType(rdb)) == -1) return -1;
@@ -573,7 +606,7 @@ off_t rdbSavedObjectLen(robj *o) {
 
 /* Save a key-value pair, with expire time, type, key, value.
  * On error -1 is returned.
- * On success if the key was actaully saved 1 is returned, otherwise 0
+ * On success if the key was actually saved 1 is returned, otherwise 0
  * is returned (the key was already expired). */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
                         long long expiretime, long long now)
@@ -698,6 +731,15 @@ int rdbSaveBackground(char *filename) {
         if (server.ipfd > 0) close(server.ipfd);
         if (server.sofd > 0) close(server.sofd);
         retval = rdbSave(filename);
+        if (retval == REDIS_OK) {
+            size_t private_dirty = zmalloc_get_private_dirty();
+
+            if (private_dirty) {
+                redisLog(REDIS_NOTICE,
+                    "RDB: %lu MB of memory used by copy-on-write",
+                    private_dirty/(1024*1024));
+            }
+        }
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
         /* Parent */
@@ -708,6 +750,7 @@ int rdbSaveBackground(char *filename) {
             return REDIS_ERR;
         }
         redisLog(REDIS_NOTICE,"Background saving started by pid %d",childpid);
+        server.rdb_save_time_start = time(NULL);
         server.rdb_child_pid = childpid;
         updateDictResizePolicy();
         return REDIS_OK;
@@ -798,7 +841,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             }
 
             /* This will also be called when the set was just converted
-             * to regular hashtable encoded set */
+             * to regular hash table encoded set */
             if (o->encoding == REDIS_ENCODING_HT) {
                 dictAdd((dict*)o->ptr,ele,NULL);
             } else {
@@ -1005,6 +1048,8 @@ void startLoading(FILE *fp) {
 /* Refresh the loading progress info */
 void loadingProgress(off_t pos) {
     server.loading_loaded_bytes = pos;
+    if (server.stat_peak_memory < zmalloc_used_memory())
+        server.stat_peak_memory = zmalloc_used_memory();
 }
 
 /* Loading finished */
@@ -1064,7 +1109,7 @@ int rdbLoad(char *filename) {
             /* We read the time so we need to read the object type again. */
             if ((type = rdbLoadType(&rdb)) == -1) goto eoferr;
             /* the EXPIRETIME opcode specifies time in seconds, so convert
-             * into milliesconds. */
+             * into milliseconds. */
             expiretime *= 1000;
         } else if (type == REDIS_RDB_OPCODE_EXPIRETIME_MS) {
             /* Milliseconds precision expire times introduced with RDB
@@ -1149,9 +1194,14 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
         redisLog(REDIS_WARNING,
             "Background saving terminated by signal %d", bysignal);
         rdbRemoveTempFile(server.rdb_child_pid);
-        server.lastbgsave_status = REDIS_ERR;
+        /* SIGUSR1 is whitelisted, so we have a way to kill a child without
+         * tirggering an error conditon. */
+        if (bysignal != SIGUSR1)
+            server.lastbgsave_status = REDIS_ERR;
     }
     server.rdb_child_pid = -1;
+    server.rdb_save_time_last = time(NULL)-server.rdb_save_time_start;
+    server.rdb_save_time_start = -1;
     /* Possibly there are slaves waiting for a BGSAVE in order to be served
      * (the first stage of SYNC is a bulk transfer of dump.rdb) */
     updateSlavesWaitingBgsave(exitcode == 0 ? REDIS_OK : REDIS_ERR);

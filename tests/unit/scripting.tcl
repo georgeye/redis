@@ -34,7 +34,7 @@ start_server {tags {"scripting"}} {
         r eval {return {1,2,3,'ciao',{1,2}}} 0
     } {1 2 3 ciao {1 2}}
 
-    test {EVAL - Are the KEYS and ARGS arrays populated correctly?} {
+    test {EVAL - Are the KEYS and ARGV arrays populated correctly?} {
         r eval {return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}} 2 a b c d
     } {a b c d}
 
@@ -45,6 +45,10 @@ start_server {tags {"scripting"}} {
 
     test {EVALSHA - Can we call a SHA1 if already defined?} {
         r evalsha 9bd632c7d33e571e9f24556ebed26c3479a87129 0
+    } {myval}
+
+    test {EVALSHA - Can we call a SHA1 in uppercase?} {
+        r evalsha 9BD632C7D33E571E9F24556EBED26C3479A87129 0
     } {myval}
 
     test {EVALSHA - Do we get an error on invalid SHA1?} {
@@ -145,6 +149,12 @@ start_server {tags {"scripting"}} {
         set e
     } {*not allowed after*}
 
+    test {EVAL - No arguments to redis.call/pcall is considered an error} {
+        set e {}
+        catch {r eval {return redis.call()} 0} e
+        set e
+    } {*one argument*}
+
     test {EVAL - redis.call variant raises a Lua error on Redis cmd error (1)} {
         set e {}
         catch {
@@ -197,23 +207,23 @@ start_server {tags {"scripting"}} {
         r eval {return redis.call('smembers','myset')} 0
     } {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
 
-    test "SORT is normally not re-ordered by the scripting engine" {
+    test "SORT is normally not alpha re-ordered for the scripting engine" {
         r del myset
         r sadd myset 1 2 3 4 10
         r eval {return redis.call('sort','myset','desc')} 0
     } {10 4 3 2 1}
 
-    test "SORT BY <constant> output gets ordered by scripting" {
+    test "SORT BY <constant> output gets ordered for scripting" {
         r del myset
         r sadd myset a b c d e f g h i l m n o p q r s t u v z aa aaa azz
         r eval {return redis.call('sort','myset','by','_')} 0
     } {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
 
-    test "SORT output containing NULLs is well handled by scripting" {
+    test "SORT BY <constant> with GET gets ordered for scripting" {
         r del myset
         r sadd myset a b c
         r eval {return redis.call('sort','myset','by','_','get','#','get','_:*')} 0
-    } {{} {} {} a b c}
+    } {a {} b {} c {}}
 
     test "redis.sha1hex() implementation" {
         list [r eval {return redis.sha1hex('')} 0] \
@@ -287,6 +297,12 @@ start_server {tags {"scripting"}} {
         assert_equal [r ping] "PONG"
     }
 
+    test {Timedout script link is still usable after Lua returns} {
+        r config set lua-time-limit 10
+        r eval {for i=1,100000 do redis.call('ping') end return 'ok'} 0
+        r ping
+    } {PONG}
+
     test {Timedout scripts that modified data can't be killed by SCRIPT KILL} {
         set rd [redis_deferring_client]
         r config set lua-time-limit 10
@@ -295,11 +311,13 @@ start_server {tags {"scripting"}} {
         catch {r ping} e
         assert_match {BUSY*} $e
         catch {r script kill} e
-        assert_match {ERR*} $e
+        assert_match {UNKILLABLE*} $e
         catch {r ping} e
         assert_match {BUSY*} $e
     }
 
+    # Note: keep this test at the end of this server stanza because it
+    # kills the server.
     test {SHUTDOWN NOSAVE can kill a timedout script anyway} {
         # The server sould be still unresponding to normal commands.
         catch {r ping} e
@@ -313,26 +331,59 @@ start_server {tags {"scripting"}} {
 
 start_server {tags {"scripting repl"}} {
     start_server {} {
-        test {Before the slave connects we issue an EVAL command} {
+        test {Before the slave connects we issue two EVAL commands} {
+            # One with an error, but still executing a command.
+            # SHA is: 6e8bd6bdccbe78899e3cc06b31b6dbf4324c2e56
+            catch {
+                r eval {redis.call('incr','x'); redis.call('nonexisting')} 0
+            }
+            # One command is correct:
+            # SHA is: ae3477e27be955de7e1bc9adfdca626b478d3cb2
             r eval {return redis.call('incr','x')} 0
-        } {1}
+        } {2}
 
         test {Connect a slave to the main instance} {
             r -1 slaveof [srv 0 host] [srv 0 port]
-            after 1000
-            s -1 role
-        } {slave}
-
-        test {Now use EVALSHA against the master} {
-            r evalsha ae3477e27be955de7e1bc9adfdca626b478d3cb2 0
-        } {2}
-
-        test {If EVALSHA was replicated as EVAL the slave should be ok} {
             wait_for_condition 50 100 {
-                [r -1 get x] eq {2}
+                [s -1 role] eq {slave} &&
+                [string match {*master_link_status:up*} [r -1 info replication]]
             } else {
-                fail "Expected 2 in x, but value is '[r -1 get x]'"
+                fail "Can't turn the instance into a slave"
             }
         }
+
+        test {Now use EVALSHA against the master, with both SHAs} {
+            # The server should replicate successful and unsuccessful
+            # commands as EVAL instead of EVALSHA.
+            catch {
+                r evalsha 6e8bd6bdccbe78899e3cc06b31b6dbf4324c2e56 0
+            }
+            r evalsha ae3477e27be955de7e1bc9adfdca626b478d3cb2 0
+        } {4}
+
+        test {If EVALSHA was replicated as EVAL, 'x' should be '4'} {
+            wait_for_condition 50 100 {
+                [r -1 get x] eq {4}
+            } else {
+                fail "Expected 4 in x, but value is '[r -1 get x]'"
+            }
+        }
+
+        test {Replication of script multiple pushes to list with BLPOP} {
+            set rd [redis_deferring_client]
+            $rd brpop a 0
+            r eval {
+                redis.call("lpush","a","1");
+                redis.call("lpush","a","2");
+            } 0
+            set res [$rd read]
+            $rd close
+            wait_for_condition 50 100 {
+                [r -1 lrange a 0 -1] eq [r lrange a 0 -1]
+            } else {
+                fail "Expected list 'a' in slave and master to be the same, but they are respectively '[r -1 lrange a 0 -1]' and '[r lrange a 0 -1]'"
+            }
+            set res
+        } {a 1}
     }
 }
